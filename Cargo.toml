@@ -1,0 +1,14 @@
+[package]
+name = "run0-tty"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true
