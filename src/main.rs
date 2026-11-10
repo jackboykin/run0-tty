@@ -1,18 +1,16 @@
-//! run0 starts pkttyagent with --fallback, so a desktop's own agent takes
-//! every prompt. An agent registered for this pid outranks it, and exec
-//! keeps the pid and parent, so polkit's kept authorizations still match.
+//! A pkttyagent that asks with one quiet line. systemd tools start the
+//! first pkttyagent in PATH to answer their polkit queries on the terminal.
+//! They pass --fallback, which would hand every prompt to a desktop's agent;
+//! this one takes them all.
 
-use std::ffi::{CStr, OsStr, OsString};
-use std::fmt::Display;
-use std::fs::{self, File};
+use std::ffi::CStr;
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::sync::atomic::{AtomicI32, Ordering::SeqCst};
 
 mod dbus;
@@ -23,100 +21,58 @@ const AGENT_PATH: &str = "/run0tty/Agent";
 const AGENT_INTERFACE: &str = "org.freedesktop.PolicyKit1.AuthenticationAgent";
 const POLKIT: &str = "org.freedesktop.PolicyKit1";
 const HELPER_SOCKET: &str = "/run/polkit/agent-helper.socket";
+const USAGE: &str = "usage: pkttyagent [--fallback] [--notify-fd FD] [--process PID]";
+
+struct Options {
+    notify: Option<File>,
+    process: libc::pid_t,
+}
 
 fn main() -> ExitCode {
-    let mut args = std::env::args_os();
-    let argv0 = args.next().unwrap_or_default();
-    // run0's own pkttyagent finds this first in PATH and quietly exits.
-    if Path::new(&argv0).file_name() == Some(OsStr::new("pkttyagent")) {
-        return ExitCode::SUCCESS;
-    }
-
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => return fail("/proc/self/exe", e),
+    let Some(opts) = options() else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(126);
     };
-    let Some(run0) = find_run0(&exe) else {
-        eprintln!("run0-tty: no other run0 in PATH");
-        return ExitCode::from(127);
+    let tty = File::options()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open("/dev/tty");
+    match tty.and_then(|tty| agent(opts, tty)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("pkttyagent: {e}");
+            ExitCode::from(127)
+        }
+    }
+}
+
+fn options() -> Option<Options> {
+    let mut opts = Options {
+        notify: None,
+        process: unsafe { libc::getppid() },
     };
-
-    let mut cmd = Command::new(&run0);
-    cmd.arg0("run0").args(args);
-    if unsafe { libc::geteuid() } != 0
-        && let Ok(tty) = File::options()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOCTTY)
-            .open("/dev/tty")
-        && spawn_agent(tty)
-    {
-        cmd.env("PATH", quiet_path(&exe));
-    }
-    let e = cmd.exec();
-    fail(run0.display(), e)
-}
-
-fn fail(what: impl Display, e: io::Error) -> ExitCode {
-    eprintln!("run0-tty: {what}: {e}");
-    ExitCode::from(126)
-}
-
-fn find_run0(exe: &Path) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join("run0"))
-        .find(|p| fs::canonicalize(p).is_ok_and(|real| real != exe))
-}
-
-fn quiet_path(exe: &Path) -> OsString {
-    let mut path = exe.with_file_name("../libexec/run0-tty").into_os_string();
-    if let Some(rest) = std::env::var_os("PATH").filter(|p| !p.is_empty()) {
-        path.push(":");
-        path.push(rest);
-    }
-    path
-}
-
-fn spawn_agent(tty: File) -> bool {
-    let parent = unsafe { libc::getpid() };
-    let mut fds = [0; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return false;
-    }
-    let (rx, tx) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
-
-    match unsafe { libc::fork() } {
-        -1 => false,
-        0 => {
-            drop(rx);
-            unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
-            if unsafe { libc::getppid() } == parent {
-                detach_stdio();
-                if let Err(e) = agent(parent, tty, tx) {
-                    eprintln!("run0-tty: agent: {e}");
-                }
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) => (name, Some(value.to_owned())),
+            None => (arg.as_str(), None),
+        };
+        let mut value = || inline.clone().or_else(|| args.next());
+        match name {
+            "--fallback" => {}
+            "--notify-fd" => {
+                let fd: RawFd = value()?.parse().ok().filter(|&fd| fd > 2)?;
+                opts.notify = Some(unsafe { File::from_raw_fd(fd) });
             }
-            unsafe { libc::_exit(0) }
-        }
-        _ => {
-            drop(tx);
-            drop(tty);
-            matches!((&rx).read(&mut [0]), Ok(1))
+            "--process" | "-p" => opts.process = value()?.split(',').next()?.parse().ok()?,
+            _ => return None,
         }
     }
+    (opts.process > 1).then_some(opts)
 }
 
-fn detach_stdio() {
-    if let Ok(null) = File::options().read(true).write(true).open("/dev/null") {
-        unsafe {
-            libc::dup2(null.as_raw_fd(), 0);
-            libc::dup2(null.as_raw_fd(), 1);
-        }
-    }
-}
-
-fn agent(parent: libc::pid_t, tty: File, mut ready: File) -> io::Result<()> {
+fn agent(opts: Options, tty: File) -> io::Result<()> {
     guard_signals();
     let mut bus = Bus::system()?;
 
@@ -140,7 +96,7 @@ fn agent(parent: libc::pid_t, tty: File, mut ready: File) -> io::Result<()> {
         w.pad(8);
         w.str("pid");
         w.sig("u");
-        w.u32(parent as u32);
+        w.u32(opts.process as u32);
         w.pad(8);
         w.str("start-time");
         w.sig("t");
@@ -159,8 +115,7 @@ fn agent(parent: libc::pid_t, tty: File, mut ready: File) -> io::Result<()> {
         "(sa{sv})ss",
         &subject.0,
     )?;
-    ready.write_all(b"1")?;
-    drop(ready);
+    drop(opts.notify);
 
     loop {
         let msg = bus.recv()?;
@@ -185,24 +140,46 @@ fn agent(parent: libc::pid_t, tty: File, mut ready: File) -> io::Result<()> {
     }
 }
 
-fn begin(tty: &File, msg: &Msg) -> Result<(), String> {
-    let (cookie, uids) = parse_begin(msg).ok_or("malformed BeginAuthentication")?;
-    let user = pick_user(&uids).ok_or("no unix-user identity offered")?;
-    match converse(tty, &user, &cookie) {
+struct Request {
+    message: String,
+    cookie: String,
+    uids: Vec<u32>,
+}
+
+fn begin(mut tty: &File, msg: &Msg) -> Result<(), String> {
+    let req = parse_begin(msg).ok_or("malformed BeginAuthentication")?;
+    let user = pick_user(&req.uids).ok_or("no unix-user identity offered")?;
+    if let Some(reason) = reason(&req.message) {
+        let line = match std::env::var_os("NO_COLOR") {
+            Some(v) if !v.is_empty() => format!("{reason}\n"),
+            _ => format!("\x1b[2m{reason}\x1b[0m\n"),
+        };
+        tty.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    match converse(tty, &user, &req.cookie) {
         Ok(true) => Ok(()),
         Ok(false) => Err("authentication failed".into()),
         Err(e) => Err(e.to_string()),
     }
 }
 
-fn parse_begin(msg: &Msg) -> Option<(String, Vec<u32>)> {
+// A transient unit's name is generated, and whoever started it knows why.
+fn reason(message: &str) -> Option<&str> {
+    let reason = message
+        .strip_prefix("Authentication is required to ")
+        .unwrap_or(message);
+    let reason = reason.strip_suffix('.').unwrap_or(reason);
+    (!reason.is_empty() && !reason.starts_with("start transient unit ")).then_some(reason)
+}
+
+fn parse_begin(msg: &Msg) -> Option<Request> {
     if msg.signature != "sssa{ss}sa(sa{sv})" {
         return None;
     }
     let mut r = msg.body();
-    for _ in 0..3 {
-        r.str()?;
-    }
+    r.str()?;
+    let message = r.str()?.to_owned();
+    r.str()?;
     r.skip(b"a{ss}")?;
     let cookie = r.str()?.to_owned();
     let mut uids = Vec::new();
@@ -219,7 +196,11 @@ fn parse_begin(msg: &Msg) -> Option<(String, Vec<u32>)> {
             }
         })
     })?;
-    Some((cookie, uids))
+    Some(Request {
+        message,
+        cookie,
+        uids,
+    })
 }
 
 fn pick_user(uids: &[u32]) -> Option<String> {
@@ -385,7 +366,16 @@ fn unescape(mut s: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::unescape;
+    use super::{reason, unescape};
+
+    #[test]
+    fn reasons_skip_transient_units() {
+        let m = "Authentication is required to restart 'nginx.service'.";
+        assert_eq!(reason(m), Some("restart 'nginx.service'"));
+        let m = "Authentication is required to start transient unit 'run-p1-i2.service'.";
+        assert_eq!(reason(m), None);
+        assert_eq!(reason("Something else"), Some("Something else"));
+    }
 
     #[test]
     fn unescapes_like_g_strescape() {

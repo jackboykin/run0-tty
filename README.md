@@ -1,20 +1,23 @@
 # run0-tty
 
-run0 that asks for your password in the terminal, not in a desktop popup:
+A terminal polkit agent for run0, systemctl and the other systemd tools. It asks in the terminal, not in a desktop popup, with one quiet line:
 
 ```
 $ run0 true
 password:
+$ systemctl restart nginx
+restart 'nginx.service'
+password:
 $
 ```
 
-run0-tty registers its own agent for its process, then runs the real run0 in that same process. polkit asks run0-tty's agent, and the agent asks on the terminal.
+systemd tools start the first `pkttyagent` in `PATH` to answer their polkit queries. run0-tty installs itself under that name, in place of polkit's own, and answers even when a desktop's agent is running.
 
-The process keeps its parent, your shell, so polkit still remembers you between calls from the same terminal.
+polkit still remembers you between calls from the same terminal.
 
 ## Install
 
-The package provides `run0-tty` and a `run0` link to it. Put it before systemd's `run0` in `PATH`:
+Put the package before polkit's `pkttyagent` in `PATH`:
 
 ```nix
 inputs.run0-tty = {
@@ -26,10 +29,11 @@ nixpkgs.overlays = [inputs.run0-tty.overlays.default];
 users.users.YOU.packages = [pkgs.run0-tty];
 ```
 
-`YOU` is your username. run0-tty requires polkit 124 or later and systemd 256 or later.
+`YOU` is your username. run0-tty requires polkit 124 or later and systemd 260 or later.
 
 ## Behavior
 
 - You get one try. A wrong password fails the command.
 - Ctrl-C or Ctrl-D at the prompt cancels.
+- The line above the prompt is polkit's reason for asking. run0 and systemd-run show none.
 - polkit remembers you only in a terminal emulator, not on a virtual console.

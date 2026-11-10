@@ -1,5 +1,5 @@
 {
-  description = "run0 that asks for the password on the terminal";
+  description = "Quiet terminal polkit agent for run0 and other systemd tools";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -22,15 +22,13 @@
         };
         cargoLock.lockFile = ./Cargo.lock;
         postInstall = ''
-          ln -s run0-tty $out/bin/run0
-          mkdir -p $out/libexec/run0-tty
-          ln -s ../../bin/run0-tty $out/libexec/run0-tty/pkttyagent
+          mv $out/bin/run0-tty $out/bin/pkttyagent
         '';
         meta = {
-          description = "run0 that asks for the password on the terminal";
+          description = "Quiet terminal polkit agent for run0 and other systemd tools";
           homepage = "https://github.com/jackboykin/run0-tty";
           license = lib.licenses.mit;
-          mainProgram = "run0-tty";
+          mainProgram = "pkttyagent";
         };
       };
     });
